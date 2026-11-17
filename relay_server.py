@@ -1,28 +1,28 @@
 import os
-import json
 import sqlite3
 import datetime
-import unicodedata
-from typing import Optional, Union
-from fastapi import FastAPI, Request, BackgroundTasks
+import asyncio
+from typing import Optional, Union, Any
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel, Field, field_validator
 import httpx
 
 app = FastAPI(
     title="TradingView Relay Server",
-    description="TradingViewのWebhookアラートを受信し、Discord各チャンネル(A/B/C)およびMT5へ並行配信・自動売買照合を行う中継サーバー",
-    version="1.1.0"
+    description="TradingViewのWebhookアラートを受信し、Discord各チャンネルおよびMT5へ並行配信・自動売買照合を行う中継サーバー",
+    version="1.8.1"
 )
 
-# 環境変数からのWebhook URL設定 (Render等での運用に対応)
-DISCORD_WEBHOOK_A = os.getenv("DISCORD_WEBHOOK_A_URL", "")  # 決済通知(即時)
-DISCORD_WEBHOOK_B = os.getenv("DISCORD_WEBHOOK_B_URL", "")  # 成績カード
-DISCORD_WEBHOOK_C = os.getenv("DISCORD_WEBHOOK_C_URL", "")  # エントリー通知(即時)
+# 環境変数からのWebhook URL設定 ( Render等での運用に対応 )
+DISCORD_WEBHOOK_A = os.getenv("DISCORD_WEBHOOK_A_URL", "")  # 決済通知用 (即時)
+DISCORD_WEBHOOK_B = os.getenv("DISCORD_WEBHOOK_B_URL", "")  # 成績カード(Embed)用
+DISCORD_WEBHOOK_C = os.getenv("DISCORD_WEBHOOK_C_URL", "")  # エントリー通知用 (即時)
 MT5_ENDPOINT_URL = os.getenv("MT5_ENDPOINT_URL", "")        # MT5発注連携用
 
 DB_PATH = os.getenv("DB_PATH", "trades.db")
 
 # ------------------------------------------------------------------------------
-# データベース初期化 (エントリー情報の一次保持用)
+# データベース初期化
 # ------------------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -35,8 +35,7 @@ def init_db():
             entry_price REAL NOT NULL,
             entry_time TEXT NOT NULL,
             volume REAL DEFAULT 0.1,
-            point_value REAL DEFAULT 0.01,
-            trigger_mode TEXT DEFAULT 'confirmed'
+            point_value REAL DEFAULT 0.01
         )
     """)
     conn.commit()
@@ -45,59 +44,68 @@ def init_db():
 init_db()
 
 # ------------------------------------------------------------------------------
-# 文字幅計算・縦揃えパディング関数
+# リクエストスキーマ (TradingView Pine Script v181からの柔軟なJSON受取)
 # ------------------------------------------------------------------------------
-def get_east_asian_width_count(text: str) -> int:
-    """全角文字=2, 半角文字=1 として表示幅を計算"""
-    count = 0
-    for ch in text:
-        w = unicodedata.east_asian_width(ch)
-        if w in ('F', 'W', 'A'):
-            count += 2
-        else:
-            count += 1
-    return count
+class AlertPayload(BaseModel):
+    secret: Optional[str] = Field(default="", description="認証キー")
+    action: str = Field(..., description="BUY, SELL, CLOSE_BUY, CLOSE_SELL など")
+    symbol: str = Field(..., description="通貨ペア・銘柄名 (例: GOLD, USDJPY)")
+    price: float = Field(..., description="約定価格")
+    time: Optional[Union[int, float, str]] = Field(default=None, description="発生日時")
+    trigger_mode: Optional[str] = Field(default="confirmed", description="confirmed または realtime")
+    reason: Optional[str] = Field(default="Band", description="決済理由 (例: Band, Center, TP, SL)")
+    alert_type: Optional[str] = Field(default=None, description="'entry' または 'exit'")
+    trade_id: Optional[str] = Field(default=None, description="エントリー識別子")
+    volume: Optional[float] = Field(default=0.1, description="ロット数")
+    point_value: Optional[float] = Field(default=None, description="1Pipの単位")
 
-def pad_label(label: str, target_width: int) -> str:
-    """指定された表示幅になるよう末尾に半角スペースを追加"""
-    current_width = get_east_asian_width_count(label)
-    padding_spaces = max(0, target_width - current_width)
-    return label + (" " * padding_spaces)
-
-# ------------------------------------------------------------------------------
-# ユーティリティ関数
-# ------------------------------------------------------------------------------
-def format_time_jst(raw_time: Optional[Union[str, int, float]]) -> str:
-    """タイムスタンプまたはISO文字列をJST (YYYY-MM-DD HH:MM:SS) 形式に整形"""
-    jst = datetime.timezone(datetime.timedelta(hours=9))
+def format_timestamp(raw_time: Optional[Union[int, float, str]]) -> str:
+    """タイムスタンプをJST (YYYY-MM-DD HH:MM:SS) 形式にフォーマット"""
     if not raw_time:
-        return datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        return now.strftime("%Y-%m-%d %H:%M:%S")
     
     try:
-        if isinstance(raw_time, (int, float)) or (isinstance(raw_time, str) and raw_time.replace('.', '', 1).isdigit()):
-            ts = float(raw_time)
-            if ts > 1e11:  # ミリ秒タイムスタンプの補正
-                ts /= 1000.0
-            dt = datetime.datetime.fromtimestamp(ts, tz=jst)
+        if isinstance(raw_time, (int, float)):
+            # ミリ秒単位の判定
+            ts = raw_time / 1000.0 if raw_time > 1e11 else float(raw_time)
+            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=9)))
             return dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        if isinstance(raw_time, str):
-            dt = datetime.datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
-            return dt.astimezone(jst).strftime("%Y-%m-%d %H:%M:%S")
+        elif isinstance(raw_time, str):
+            if raw_time.isdigit():
+                ts = float(raw_time) / 1000.0 if float(raw_time) > 1e11 else float(raw_time)
+                dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=9)))
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            return raw_time.split(".")[0].replace("T", " ")
     except Exception:
         pass
-        
-    return str(raw_time)
+    
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    return now.strftime("%Y-%m-%d %H:%M:%S")
 
-def get_point_value(symbol: str, user_point: Optional[float] = None) -> float:
-    """1 Pips相当の価格単位を判定"""
-    if user_point and user_point > 0:
-        return user_point
+def align_lines(items: list[tuple[str, str]]) -> str:
+    """項目と値を全自動でコロン(:)位置が揃うように整形"""
+    max_len = 0
+    for label, _ in items:
+        # 全角文字は幅2、半角文字は幅1として計算
+        w = sum(2 if ord(c) > 127 else 1 for c in label)
+        if w > max_len:
+            max_len = w
+
+    lines = []
+    for label, val in items:
+        w = sum(2 if ord(c) > 127 else 1 for c in label)
+        pad = max_len - w
+        # 半角スペースで調整
+        lines.append(f"・{label}{' ' * pad} : {val}")
+    return "\n".join(lines)
+
+def calc_point_value(symbol: str) -> float:
     sym = symbol.upper()
-    if "JPY" in sym:
-        return 0.01
-    elif "XAU" in sym or "GOLD" in sym:
+    if "GOLD" in sym or "XAU" in sym:
         return 0.1
+    elif "JPY" in sym:
+        return 0.01
     else:
         return 0.0001
 
@@ -105,9 +113,8 @@ def get_point_value(symbol: str, user_point: Optional[float] = None) -> float:
 # 配信用ヘルパー関数
 # ------------------------------------------------------------------------------
 async def send_discord_webhook(url: str, payload: dict):
-    """Discord Webhookへ非同期でPOSTリクエストを送信"""
     if not url:
-        print("[WARN] Discord Webhook URLが設定されていません。")
+        print("[WARN] Discord Webhook URLが未設定のため送信スキップ")
         return
     async with httpx.AsyncClient() as client:
         try:
@@ -117,9 +124,8 @@ async def send_discord_webhook(url: str, payload: dict):
             print(f"[ERROR] Discord送信失敗 ({url}): {e}")
 
 async def forward_to_mt5(payload_dict: dict):
-    """MT5側中継/EAへシグナルを転送する関数"""
     if not MT5_ENDPOINT_URL:
-        print("[INFO] MT5連携URLが未設定のため、MT5転送はスキップされました。")
+        print("[INFO] MT5連携URLが未設定のため転送スキップ")
         return
     async with httpx.AsyncClient() as client:
         try:
@@ -129,174 +135,142 @@ async def forward_to_mt5(payload_dict: dict):
             print(f"[ERROR] MT5転送失敗: {e}")
 
 # ------------------------------------------------------------------------------
-# メインWebhookエンドポイント (422エラー回避のためRequest直接受取)
+# メインWebhookエンドポイント
 # ------------------------------------------------------------------------------
 @app.post("/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    # 非JSON形式のアラート（TV標準テキスト等）の自動判定・フォールバック
     try:
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8").strip()
+        import json
+        json_data = json.loads(body_str)
+        payload = AlertPayload(**json_data)
     except Exception as e:
-        return {"status": "error", "message": f"Failed to read request body: {e}"}
-
-    # JSONパース試行
-    try:
-        data = json.loads(body_str)
-    except Exception:
         print(f"[INFO] 非JSON形式の通知を受信(自動スキップ): {body_str[:100]}...")
         return {"status": "ignored", "message": "Non-JSON alert received & ignored gracefully"}
 
-    if not isinstance(data, dict):
-        return {"status": "ignored", "message": "Invalid JSON format"}
-
-    # 主要データの取得・初期化
-    action = str(data.get("action", "")).upper()
-    symbol = str(data.get("symbol", "UNKNOWN")).upper()
-    
-    try:
-        price = float(data.get("price", 0.0))
-    except (ValueError, TypeError):
-        price = 0.0
-
-    if not action or price <= 0:
-        return {"status": "ignored", "message": "Missing required fields (action or price)"}
-
-    # アラート種別の判定 (entry / exit)
-    raw_alert_type = data.get("alert_type")
-    if raw_alert_type:
-        alert_type = str(raw_alert_type).lower()
-    elif "CLOSE" in action:
-        alert_type = "exit"
-    elif "BUY" in action or "SELL" in action:
-        alert_type = "entry"
-    else:
-        alert_type = "entry"
-
-    # 売買方向の判定
-    position_type = "BUY" if "BUY" in action else "SELL"
-    
-    # 照合用trade_idの自動設定
-    trade_id = data.get("trade_id")
-    if not trade_id:
-        trade_id = f"{symbol}_{position_type}"
-
-    time_str = format_time_jst(data.get("time"))
-    trigger_mode = str(data.get("trigger_mode", "confirmed")).lower()
-    cond_name = "確定足" if "confirm" in trigger_mode else "リアルタイム"
-    reason_str = str(data.get("reason", "")).strip() or "Band"
-    volume = float(data.get("volume", 0.1)) if data.get("volume") is not None else 0.1
-    point = get_point_value(symbol, data.get("point_value"))
+    action_upper = payload.action.upper()
+    dt_str = format_timestamp(payload.time)
+    mode_str = "確定足" if payload.trigger_mode == "confirmed" else "リアルタイム"
+    mt5_str = "ON" if MT5_ENDPOINT_URL else "OFF"
+    point = payload.point_value or calc_point_value(payload.symbol)
 
     # --------------------------------------------------------------------------
-    # 1. エントリーアラートの処理 (【チャンネルC】通知)
+    # A. エントリー通知 (BUY / SELL / COUNTER_BUY / COUNTER_SELL) ➔ チャンネルC
     # --------------------------------------------------------------------------
-    if alert_type == "entry":
-        # SQLiteへ保存
+    if action_upper in ["BUY", "SELL", "COUNTER_BUY", "COUNTER_SELL"]:
+        is_buy = "BUY" in action_upper
+        act_clean = "BUY" if is_buy else "SELL"
+        trade_id = payload.trade_id or f"{payload.symbol}_{act_clean}"
+
+        # DBへエントリー情報を記録
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT OR REPLACE INTO active_trades 
-               (trade_id, symbol, action, entry_price, entry_time, volume, point_value, trigger_mode) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (trade_id, symbol, action, price, time_str, volume, point, trigger_mode)
+            "INSERT OR REPLACE INTO active_trades (trade_id, symbol, action, entry_price, entry_time, volume, point_value) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (trade_id, payload.symbol, act_clean, payload.price, dt_str, payload.volume, point)
         )
         conn.commit()
         conn.close()
 
         # 【チャンネルC】エントリー通知 (即時)
-        icon = "🟩" if position_type == "BUY" else "🟥"
-        msg_c_lines = [
-            f"{icon}【{position_type} 検知】",
-            f"{pad_label('・銘柄', 8)}: {symbol}",
-            f"{pad_label('・価格', 8)}: {price:.2f}",
-            f"{pad_label('・条件', 8)}: {cond_name}",
-            f"{pad_label('・コード', 8)}: VIDYA Signal v8",
-            f"{pad_label('・日時', 8)}: {time_str}"
+        icon = "🟩" if is_buy else "🟥"
+        header = f"{icon}【{act_clean} 検知】"
+        items = [
+            ("銘柄", payload.symbol),
+            ("価格", f"{payload.price:.2f}" if "GOLD" in payload.symbol.upper() or "JPY" in payload.symbol.upper() else f"{payload.price:.5f}"),
+            ("条件", mode_str),
+            ("コード", "VIDYA Signal v8"),
+            ("日時", dt_str)
         ]
-        payload_c = {"content": "```text\n" + "\n".join(msg_c_lines) + "\n```"}
-        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_C, payload_c)
+        msg_body = align_lines(items)
+        content_text = f"```text\n{header}\n{msg_body}\n```"
 
-        # MT5への転送
-        background_tasks.add_task(forward_to_mt5, data)
+        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_C, {"content": content_text})
+        background_tasks.add_task(forward_to_mt5, payload.model_dump())
 
         return {"status": "success", "message": "Entry processed", "trade_id": trade_id}
 
     # --------------------------------------------------------------------------
-    # 2. 決済アラートの処理 (【チャンネルA】および【チャンネルB】通知)
+    # B. 決済通知 (CLOSE_BUY / CLOSE_SELL) ➔ チャンネルA (即時) & チャンネルB (成績カード)
     # --------------------------------------------------------------------------
-    elif alert_type == "exit":
-        # SQLiteからエントリー情報を取得
+    elif action_upper in ["CLOSE_BUY", "CLOSE_SELL"]:
+        pos_dir = "BUY" if "BUY" in action_upper else "SELL"
+        trade_id = payload.trade_id or f"{payload.symbol}_{pos_dir}"
+
+        # DBからエントリー情報を検索
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT symbol, action, entry_price, entry_time, volume, point_value FROM active_trades WHERE trade_id = ?",
-            (trade_id,)
-        )
+        cursor.execute("SELECT symbol, action, entry_price, entry_time, volume, point_value FROM active_trades WHERE trade_id = ?", (trade_id,))
         row = cursor.fetchone()
 
-        entry_price = price
-        pips = 0.0
+        entry_info = None
         if row:
-            entry_action = row[1]
-            entry_price = float(row[2])
-            p_val = float(row[5]) or point
-
-            # Pips計算
-            if "BUY" in entry_action.upper():
-                pips = (price - entry_price) / p_val
-            else:
-                pips = (entry_price - price) / p_val
-
-            # レコード削除
+            entry_info = {
+                "symbol": row[0],
+                "action": row[1],
+                "entry_price": row[2],
+                "entry_time": row[3],
+                "volume": row[4],
+                "point_value": row[5]
+            }
             cursor.execute("DELETE FROM active_trades WHERE trade_id = ?", (trade_id,))
             conn.commit()
         conn.close()
 
-        pips_str = f"+{pips:.1f}" if pips >= 0 else f"{pips:.1f}"
+        # Pips損益の計算
+        pips_str = "+0.0 Pips"
+        pips_val = 0.0
+        entry_price_val = payload.price
+        if entry_info:
+            entry_price_val = entry_info["entry_price"]
+            p_val = entry_info["point_value"] or point
+            if entry_info["action"] == "BUY":
+                pips_val = (payload.price - entry_price_val) / p_val
+            else:
+                pips_val = (entry_price_val - payload.price) / p_val
+            pips_str = f"+{pips_val:.1f} Pips" if pips_val >= 0 else f"{pips_val:.1f} Pips"
+
+        reason_clean = payload.reason or "Band"
 
         # 【チャンネルA】決済通知 (即時)
-        msg_a_lines = [
-            "🟦【決済 検知】",
-            f"{pad_label('・銘柄', 8)}: {symbol} ({position_type})",
-            f"{pad_label('・価格', 8)}: {price:.2f}",
-            f"{pad_label('・損益', 8)}: {pips_str} Pips",
-            f"{pad_label('・理由', 8)}: {reason_str}",
-            f"{pad_label('・コード', 8)}: VIDYA Signal v8",
-            f"{pad_label('・日時', 8)}: {time_str}"
+        header_a = f"🟦【決済 検知】"
+        items_a = [
+            ("銘柄", f"{payload.symbol} ({pos_dir})"),
+            ("価格", f"{payload.price:.2f}" if "GOLD" in payload.symbol.upper() or "JPY" in payload.symbol.upper() else f"{payload.price:.5f}"),
+            ("損益", pips_str),
+            ("理由", reason_clean),
+            ("コード", "VIDYA Signal v8"),
+            ("日時", dt_str)
         ]
-        payload_a = {"content": "```text\n" + "\n".join(msg_a_lines) + "\n```"}
-        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_A, payload_a)
+        msg_body_a = align_lines(items_a)
+        content_a = f"```text\n{header_a}\n{msg_body_a}\n```"
+        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_A, {"content": content_a})
 
-        # 【チャンネルB】トレード完了成績カード (Embed / Card)
-        card_icon = "🏆" if pips >= 0 else "⚠️"
-        mt5_status = "ON" if MT5_ENDPOINT_URL else "OFF"
-        price_label = f"・{position_type}価格"
-
-        msg_b_lines = [
-            f"{card_icon}【トレード完了】結果: {pips_str} Pips",
-            "----------------------------------",
-            f"{pad_label('・銘柄', 10)}: {symbol}",
-            f"{pad_label(price_label, 10)}: {entry_price:.2f}",
-            f"{pad_label('・決済価格', 10)}: {price:.2f}",
-            f"{pad_label('・決済理由', 10)}: {reason_str}",
-            f"{pad_label('・コード', 10)}: VIDYA Signal v8",
-            f"{pad_label('・決済日時', 10)}: {time_str}",
-            f"{pad_label('・MT5連携', 10)}: {mt5_status}",
-            "----------------------------------"
+        # 【チャンネルB】トレード完了成績カード (Embed)
+        trophy = "🏆" if pips_val >= 0 else "⚠️"
+        header_b = f"{trophy}【トレード完了】結果: {pips_str}\n----------------------------------"
+        items_b = [
+            ("銘柄", payload.symbol),
+            (f"{pos_dir}価格", f"{entry_price_val:.2f}" if "GOLD" in payload.symbol.upper() or "JPY" in payload.symbol.upper() else f"{entry_price_val:.5f}"),
+            ("決済価格", f"{payload.price:.2f}" if "GOLD" in payload.symbol.upper() or "JPY" in payload.symbol.upper() else f"{payload.price:.5f}"),
+            ("決済理由", reason_clean),
+            ("コード", "VIDYA Signal v8"),
+            ("決済日時", dt_str),
+            ("MT5連携", mt5_str)
         ]
-        payload_b = {"content": "```text\n" + "\n".join(msg_b_lines) + "\n```"}
-        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_B, payload_b)
+        msg_body_b = align_lines(items_b)
+        content_b = f"```text\n{header_b}\n{msg_body_b}\n----------------------------------\n```"
+        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_B, {"content": content_b})
 
-        # MT5への転送
-        background_tasks.add_task(forward_to_mt5, data)
+        background_tasks.add_task(forward_to_mt5, payload.model_dump())
 
         return {"status": "success", "message": "Exit processed & notifications sent", "trade_id": trade_id}
 
-    return {"status": "ignored", "message": "Unhandled request"}
+    else:
+        return {"status": "ignored", "message": f"Action '{payload.action}' not handled"}
 
-# ------------------------------------------------------------------------------
-# サーバー起動チェック用ヘルスチェック
-# ------------------------------------------------------------------------------
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "TradingView Relay Server"}
