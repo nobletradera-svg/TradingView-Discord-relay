@@ -1,91 +1,307 @@
-# TradingView Relay Server 運用＆統合仕様書 (v1.1.0)
+import os
+import json
+import sqlite3
+import datetime
+import unicodedata
+from typing import Optional, Union
+from fastapi import FastAPI, Request, BackgroundTasks
+import httpx
 
-TradingViewのPine Script v180と連携し、Discord（A/B/C各チャンネル）およびMT5へ自動判定配信を行う中継サーバー（relay_server.py）の最終仕様書です。
+app = FastAPI(
+    title="TradingView Relay Server",
+    description="TradingViewのWebhookアラートを受信し、Discord各チャンネル(A/B/C)およびMT5へ並行配信・自動売買照合を行う中継サーバー",
+    version="1.1.0"
+)
 
----
+# 環境変数からのWebhook URL設定 (Render等での運用に対応)
+DISCORD_WEBHOOK_A = os.getenv("DISCORD_WEBHOOK_A_URL", "")  # 決済通知(即時)
+DISCORD_WEBHOOK_B = os.getenv("DISCORD_WEBHOOK_B_URL", "")  # 成績カード
+DISCORD_WEBHOOK_C = os.getenv("DISCORD_WEBHOOK_C_URL", "")  # エントリー通知(即時)
+MT5_ENDPOINT_URL = os.getenv("MT5_ENDPOINT_URL", "")        # MT5発注連携用
 
-## 1. Discord通知チャンネル構成 & KEYマッピング
+DB_PATH = os.getenv("DB_PATH", "trades.db")
 
-Render等の環境変数（KEY）に設定したWebhook URLに応じて、シグナルを全自動振り分け配信します。
+# ------------------------------------------------------------------------------
+# データベース初期化 (エントリー情報の一次保持用)
+# ------------------------------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS active_trades (
+            trade_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            entry_time TEXT NOT NULL,
+            volume REAL DEFAULT 0.1,
+            point_value REAL DEFAULT 0.01,
+            trigger_mode TEXT DEFAULT 'confirmed'
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-| Render環境変数 (KEY) | Discordチャンネル役割 | 通知形式 | 主な配信タイミング |
-| :--- | :--- | :--- | :--- |
-| **`DISCORD_WEBHOOK_C_URL`** | **【チャンネルC】** エントリー通知 | 即時通知 | エントリー発生時 (`BUY` / `SELL`) |
-| **`DISCORD_WEBHOOK_A_URL`** | **【チャンネルA】** 決済通知 | 即時通知 | 決済検出時 (`CLOSE_BUY` / `CLOSE_SELL`) ※Pips損益付き |
-| **`DISCORD_WEBHOOK_B_URL`** | **【チャンネルB】** トレード完了成績カード | 確定カード | DB照合完了時 (エントリー価格・決済価格・Pips・保有条件) |
-| **`MT5_ENDPOINT_URL`** | **【MT5連携】** 自動売買端末転送 | JSONシグナル | エントリーおよび決済発生時に即時転送 |
+init_db()
 
----
+# ------------------------------------------------------------------------------
+# 文字幅計算・縦揃えパディング関数
+# ------------------------------------------------------------------------------
+def get_east_asian_width_count(text: str) -> int:
+    """全角文字=2, 半角文字=1 として表示幅を計算"""
+    count = 0
+    for ch in text:
+        w = unicodedata.east_asian_width(ch)
+        if w in ('F', 'W', 'A'):
+            count += 2
+        else:
+            count += 1
+    return count
 
-## 2. Discord通知デザイン & レイアウト仕様
+def pad_label(label: str, target_width: int) -> str:
+    """指定された表示幅になるよう末尾に半角スペースを追加"""
+    current_width = get_east_asian_width_count(label)
+    padding_spaces = max(0, target_width - current_width)
+    return label + (" " * padding_spaces)
 
-すべての通知はコードブロック（```text ... ```）で囲まれ、Python側で表示幅が自動計算されるため、スマホ・PC問わず **`:`（コロン）の縦ラインが一直線に美しく整列** します。
+# ------------------------------------------------------------------------------
+# ユーティリティ関数
+# ------------------------------------------------------------------------------
+def format_time_jst(raw_time: Optional[Union[str, int, float]]) -> str:
+    """タイムスタンプまたはISO文字列をJST (YYYY-MM-DD HH:MM:SS) 形式に整形"""
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    if not raw_time:
+        return datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
+    
+    try:
+        if isinstance(raw_time, (int, float)) or (isinstance(raw_time, str) and raw_time.replace('.', '', 1).isdigit()):
+            ts = float(raw_time)
+            if ts > 1e11:  # ミリ秒タイムスタンプの補正
+                ts /= 1000.0
+            dt = datetime.datetime.fromtimestamp(ts, tz=jst)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        if isinstance(raw_time, str):
+            dt = datetime.datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            return dt.astimezone(jst).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+        
+    return str(raw_time)
 
-### 🟢 【チャンネルC】エントリー通知 (即時)
+def get_point_value(symbol: str, user_point: Optional[float] = None) -> float:
+    """1 Pips相当の価格単位を判定"""
+    if user_point and user_point > 0:
+        return user_point
+    sym = symbol.upper()
+    if "JPY" in sym:
+        return 0.01
+    elif "XAU" in sym or "GOLD" in sym:
+        return 0.1
+    else:
+        return 0.0001
 
-```text
-🟩【BUY 検知】
-・銘柄  : GOLD
-・価格  : 2680.50
-・条件  : 確定足
-・コード: VIDYA Signal v8
-・日時  : 2026-11-17 01:00:00
-```
-*(※ SELL時は `🟥【SELL 検知】` に自動切り替え)*
+# ------------------------------------------------------------------------------
+# 配信用ヘルパー関数
+# ------------------------------------------------------------------------------
+async def send_discord_webhook(url: str, payload: dict):
+    """Discord Webhookへ非同期でPOSTリクエストを送信"""
+    if not url:
+        print("[WARN] Discord Webhook URLが設定されていません。")
+        return
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(url, json=payload, timeout=10.0)
+            res.raise_for_status()
+        except Exception as e:
+            print(f"[ERROR] Discord送信失敗 ({url}): {e}")
 
----
+async def forward_to_mt5(payload_dict: dict):
+    """MT5側中継/EAへシグナルを転送する関数"""
+    if not MT5_ENDPOINT_URL:
+        print("[INFO] MT5連携URLが未設定のため、MT5転送はスキップされました。")
+        return
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(MT5_ENDPOINT_URL, json=payload_dict, timeout=5.0)
+            print(f"[MT5] 応答ステータス: {res.status_code}")
+        except Exception as e:
+            print(f"[ERROR] MT5転送失敗: {e}")
 
-### 🟦 【チャンネルA】決済通知 (即時)
+# ------------------------------------------------------------------------------
+# メインWebhookエンドポイント (422エラー回避のためRequest直接受取)
+# ------------------------------------------------------------------------------
+@app.post("/webhook")
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8").strip()
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to read request body: {e}"}
 
-```text
-🟦【決済 検知】
-・銘柄  : GOLD (BUY)
-・価格  : 2695.20
-・損益  : +147.0 Pips
-・理由  : Band
-・コード: VIDYA Signal v8
-・日時  : 2026-11-17 02:15:00
-```
+    # JSONパース試行
+    try:
+        data = json.loads(body_str)
+    except Exception:
+        print(f"[INFO] 非JSON形式の通知を受信(自動スキップ): {body_str[:100]}...")
+        return {"status": "ignored", "message": "Non-JSON alert received & ignored gracefully"}
 
----
+    if not isinstance(data, dict):
+        return {"status": "ignored", "message": "Invalid JSON format"}
 
-### 🏆 【チャンネルB】トレード完了成績カード
+    # 主要データの取得・初期化
+    action = str(data.get("action", "")).upper()
+    symbol = str(data.get("symbol", "UNKNOWN")).upper()
+    
+    try:
+        price = float(data.get("price", 0.0))
+    except (ValueError, TypeError):
+        price = 0.0
 
-```text
-🏆【トレード完了】結果: +147.0 Pips
-----------------------------------
-・銘柄    : GOLD
-・BUY価格 : 2680.50
-・決済価格: 2695.20
-・決済理由: Band
-・コード  : VIDYA Signal v8
-・決済日時: 2026-11-17 02:15:00
-・MT5連携 : ON
-----------------------------------
-```
-*(※ 負けトレード時は `⚠️【トレード完了】結果: -30.0 Pips` に自動切り替え)*
+    if not action or price <= 0:
+        return {"status": "ignored", "message": "Missing required fields (action or price)"}
 
----
+    # アラート種別の判定 (entry / exit)
+    raw_alert_type = data.get("alert_type")
+    if raw_alert_type:
+        alert_type = str(raw_alert_type).lower()
+    elif "CLOSE" in action:
+        alert_type = "exit"
+    elif "BUY" in action or "SELL" in action:
+        alert_type = "entry"
+    else:
+        alert_type = "entry"
 
-## 3. 422エラー＆タイムアウト完全回避ロジック
+    # 売買方向の判定
+    position_type = "BUY" if "BUY" in action else "SELL"
+    
+    # 照合用trade_idの自動設定
+    trade_id = data.get("trade_id")
+    if not trade_id:
+        trade_id = f"{symbol}_{position_type}"
 
-1. **HTTP 422 (Unprocessable Content) 回避**
-   - Pine Script v180から送られるJSON (`action`, `symbol`, `price`, `time`, `trigger_mode`, `reason`) に合わせた受取処理を実装。
-   - `alert_type` や `trade_id` が送られない場合でも、`action` 文字列からエントリー／決済を自動判別し、`銘柄+売買方向` でデータベース照合を完了させます。
-   - テキスト通知やpingテストなどの非JSON通信が届いた場合でもエラーを返さず、`200 OK` で安全に流します。
+    time_str = format_time_jst(data.get("time"))
+    trigger_mode = str(data.get("trigger_mode", "confirmed")).lower()
+    cond_name = "確定足" if "confirm" in trigger_mode else "リアルタイム"
+    reason_str = str(data.get("reason", "")).strip() or "Band"
+    volume = float(data.get("volume", 0.1)) if data.get("volume") is not None else 0.1
+    point = get_point_value(symbol, data.get("point_value"))
 
-2. **タイムアウト (Cold Start) 回避**
-   - Render無料プランの15分スリープ対策として、外部の無料監視サービス等から Render URL へ定期的なPing設定を推奨します。
+    # --------------------------------------------------------------------------
+    # 1. エントリーアラートの処理 (【チャンネルC】通知)
+    # --------------------------------------------------------------------------
+    if alert_type == "entry":
+        # SQLiteへ保存
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO active_trades 
+               (trade_id, symbol, action, entry_price, entry_time, volume, point_value, trigger_mode) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trade_id, symbol, action, price, time_str, volume, point, trigger_mode)
+        )
+        conn.commit()
+        conn.close()
 
----
+        # 【チャンネルC】エントリー通知 (即時)
+        icon = "🟩" if position_type == "BUY" else "🟥"
+        msg_c_lines = [
+            f"{icon}【{position_type} 検知】",
+            f"{pad_label('・銘柄', 8)}: {symbol}",
+            f"{pad_label('・価格', 8)}: {price:.2f}",
+            f"{pad_label('・条件', 8)}: {cond_name}",
+            f"{pad_label('・コード', 8)}: VIDYA Signal v8",
+            f"{pad_label('・日時', 8)}: {time_str}"
+        ]
+        payload_c = {"content": "```text\n" + "\n".join(msg_c_lines) + "\n```"}
+        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_C, payload_c)
 
-## 4. GitHub更新 & Renderデプロイ手順
+        # MT5への転送
+        background_tasks.add_task(forward_to_mt5, data)
 
-1. ローカルの `relay_server.py` を本リポジトリの最新版コードへ差し替えます。
-2. Gitコミット＆プッシュを実行：
-   ```bash
-   git add relay_server.py
-   git commit -m "Update relay_server v1.1.0 (Align layout, fix 422 error, updated channels A/B/C)"
-   git push origin main
-   ```
-3. Renderが自動検知してデプロイが完了したら、環境変数 `DISCORD_WEBHOOK_A_URL`, `DISCORD_WEBHOOK_B_URL`, `DISCORD_WEBHOOK_C_URL` を設定の上、運用を開始してください。
+        return {"status": "success", "message": "Entry processed", "trade_id": trade_id}
+
+    # --------------------------------------------------------------------------
+    # 2. 決済アラートの処理 (【チャンネルA】および【チャンネルB】通知)
+    # --------------------------------------------------------------------------
+    elif alert_type == "exit":
+        # SQLiteからエントリー情報を取得
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT symbol, action, entry_price, entry_time, volume, point_value FROM active_trades WHERE trade_id = ?",
+            (trade_id,)
+        )
+        row = cursor.fetchone()
+
+        entry_price = price
+        pips = 0.0
+        if row:
+            entry_action = row[1]
+            entry_price = float(row[2])
+            p_val = float(row[5]) or point
+
+            # Pips計算
+            if "BUY" in entry_action.upper():
+                pips = (price - entry_price) / p_val
+            else:
+                pips = (entry_price - price) / p_val
+
+            # レコード削除
+            cursor.execute("DELETE FROM active_trades WHERE trade_id = ?", (trade_id,))
+            conn.commit()
+        conn.close()
+
+        pips_str = f"+{pips:.1f}" if pips >= 0 else f"{pips:.1f}"
+
+        # 【チャンネルA】決済通知 (即時)
+        msg_a_lines = [
+            "🟦【決済 検知】",
+            f"{pad_label('・銘柄', 8)}: {symbol} ({position_type})",
+            f"{pad_label('・価格', 8)}: {price:.2f}",
+            f"{pad_label('・損益', 8)}: {pips_str} Pips",
+            f"{pad_label('・理由', 8)}: {reason_str}",
+            f"{pad_label('・コード', 8)}: VIDYA Signal v8",
+            f"{pad_label('・日時', 8)}: {time_str}"
+        ]
+        payload_a = {"content": "```text\n" + "\n".join(msg_a_lines) + "\n```"}
+        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_A, payload_a)
+
+        # 【チャンネルB】トレード完了成績カード (Embed / Card)
+        card_icon = "🏆" if pips >= 0 else "⚠️"
+        mt5_status = "ON" if MT5_ENDPOINT_URL else "OFF"
+        price_label = f"・{position_type}価格"
+
+        msg_b_lines = [
+            f"{card_icon}【トレード完了】結果: {pips_str} Pips",
+            "----------------------------------",
+            f"{pad_label('・銘柄', 10)}: {symbol}",
+            f"{pad_label(price_label, 10)}: {entry_price:.2f}",
+            f"{pad_label('・決済価格', 10)}: {price:.2f}",
+            f"{pad_label('・決済理由', 10)}: {reason_str}",
+            f"{pad_label('・コード', 10)}: VIDYA Signal v8",
+            f"{pad_label('・決済日時', 10)}: {time_str}",
+            f"{pad_label('・MT5連携', 10)}: {mt5_status}",
+            "----------------------------------"
+        ]
+        payload_b = {"content": "```text\n" + "\n".join(msg_b_lines) + "\n```"}
+        background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_B, payload_b)
+
+        # MT5への転送
+        background_tasks.add_task(forward_to_mt5, data)
+
+        return {"status": "success", "message": "Exit processed & notifications sent", "trade_id": trade_id}
+
+    return {"status": "ignored", "message": "Unhandled request"}
+
+# ------------------------------------------------------------------------------
+# サーバー起動チェック用ヘルスチェック
+# ------------------------------------------------------------------------------
+@app.get("/")
+def health_check():
+    return {"status": "ok", "service": "TradingView Relay Server"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("relay_server:app", host="0.0.0.0", port=port, reload=True)
