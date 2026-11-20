@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import httpx
 
-app = FastAPI(title="TradingView Relay Server", version="2.0.1")
+app = FastAPI(title="TradingView Relay Server", version="2.0.0")
 
 # ------------------------------------------------------------------------------
 # 環境変数設定
@@ -49,7 +49,7 @@ def convert_symbol_for_mt5(symbol: str) -> str:
     return raw_sym
 
 def calc_point_value(symbol: str) -> float:
-    """銘柄ごとのPips計算用ポイント値を最適化"""
+    """銘柄ごとのPips計算用ポイント値"""
     sym = symbol.upper()
     if "GOLD" in sym or "XAU" in sym:
         return 0.1
@@ -101,21 +101,8 @@ class AlertPayload(BaseModel):
     volume: Optional[float] = Field(default=0.1)
     point_value: Optional[float] = Field(default=None)
 
-def format_timestamp(raw_time: Optional[Union[int, float, str]]) -> str:
-    if not raw_time:
-        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-        return now.strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        if isinstance(raw_time, (int, float)):
-            ts = raw_time / 1000.0 if raw_time > 1e11 else float(raw_time)
-            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=9)))
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        elif isinstance(raw_time, str) and raw_time.isdigit():
-            ts = float(raw_time) / 1000.0 if float(raw_time) > 1e11 else float(raw_time)
-            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=9)))
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
+def get_jst_now_str() -> str:
+    """リアルタイム受信時刻 (JST 日本標準時) を取得"""
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -125,7 +112,7 @@ def align_lines(items: list[tuple[str, str]]) -> str:
     lines = []
     for label, val in items:
         w = sum(2 if ord(c) > 127 else 1 for c in label)
-        lines.append(f" ・{label}{' ' * (max_len - w)} : {val}")
+        lines.append(f"・{label}{' ' * (max_len - w)} : {val}")
     return "\n".join(lines)
 
 async def send_discord_webhook(url: str, payload: dict):
@@ -149,7 +136,7 @@ async def forward_to_mt5(payload_dict: dict):
             print(f"[ERROR] MT5転送失敗: {e}")
 
 def parse_raw_text_payload(body_text: str) -> Optional[dict]:
-    """JSON以外のテキスト形式アラートから必要情報を正規表現で安全に抽出"""
+    """JSON以外のテキスト形式アラートから必要情報を正規表現で抽出"""
     try:
         action_match = re.search(r'\b(BUY|SELL|CLOSE_BUY|CLOSE_SELL|COUNTER_BUY|COUNTER_SELL)\b', body_text, re.IGNORECASE)
         if not action_match:
@@ -191,6 +178,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
 
     payload_dict = None
 
+    # 1. JSON形式としてパース試行
     try:
         raw_json = json.loads(body_text)
         if isinstance(raw_json, dict):
@@ -198,13 +186,15 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         pass
 
+    # 2. JSONでパースできなかった場合、テキスト抽出を試行
     if not payload_dict:
         extracted = parse_raw_text_payload(body_text)
         if extracted:
             payload_dict = extracted
 
+    # 3. 解析が完全に失敗した場合の安全なエラー処理
     if not payload_dict or "action" not in payload_dict or "symbol" not in payload_dict:
-        dt_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+        dt_now = get_jst_now_str()
         err_msg = f"⚠️【緊急通知】Webhookパース失敗\n・受信日時 : {dt_now}\n・エラー    : JSON/テキスト解析不能\n・受信内容 : {body_text[:200]}"
         print(f"[ERROR] Webhookパース失敗: {body_text}")
         background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_A or DISCORD_WEBHOOK_C, {"content": f"```text\n{err_msg}\n```"})
@@ -213,27 +203,31 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
             content={"status": "error", "message": "⚠️ [パース失敗] 有効なシグナル項目(action/symbol)を抽出できませんでした。"}
         )
 
+    # Pydanticモデル化
     try:
         payload = AlertPayload(**payload_dict)
     except Exception as e:
         return JSONResponse(status_code=422, content={"status": "error", "message": f"フィールド検証エラー: {str(e)}"})
 
+    # 4. 認証キー (WEBHOOK_SECRET) の厳格検証
     if WEBHOOK_SECRET and payload.secret != WEBHOOK_SECRET:
-        dt_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+        dt_now = get_jst_now_str()
         print(f"[SECURITY] 認証キー不一致で拒否: 届いたキー='{payload.secret}'")
         err_msg = f"🚨【セキュリティ拒否】認証キー不一致\n・受信日時 : {dt_now}\n・届いたキー: '{payload.secret}'\n・銘柄/方向 : {payload.symbol} / {payload.action}"
         background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_A or DISCORD_WEBHOOK_C, {"content": f"```text\n{err_msg}\n```"})
         return JSONResponse(
             status_code=401,
-            content={"status": "unauthorized", "message": f"🚨 [拒否] 認証キーが不一致です。"}
+            content={"status": "unauthorized", "message": f"🚨 [拒否] 認証キーが不一致です。(届いたキー: '{payload.secret}')"}
         )
 
     action_upper = payload.action.upper()
-    dt_str = format_timestamp(payload.time)
+    # 【改修】通知内の表示時刻は常に「サーバーがリアルタイム受信した日本時刻」を使用
+    dt_str = get_jst_now_str()
     mode_str = "確定足" if payload.trigger_mode == "confirmed" else "リアルタイム"
     mt5_str = "ON" if MT5_ENDPOINT_URL else "OFF"
     point = payload.point_value or calc_point_value(payload.symbol)
 
+    # MT5用に銘柄名を自動変換
     mt5_symbol = convert_symbol_for_mt5(payload.symbol)
     mt5_payload_dict = payload.model_dump()
     mt5_payload_dict["symbol"] = mt5_symbol
@@ -288,24 +282,22 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
             entry_info = {"symbol": row[0], "action": row[1], "entry_price": row[2], "entry_time": row[3], "volume": row[4], "point_value": row[5]}
             cursor.execute("DELETE FROM active_trades WHERE trade_id = ?", (trade_id,))
             conn.commit()
-        else:
-            print(f"[WARN] DBにアクティブなエントリー記録がありませんでした (trade_id: {trade_id})。")
         conn.close()
 
-        pips_str = "+0.0 Pips"
+        pips_str = "+0.0 Pips (エントリー未保持)"
         pips_val = 0.0
         entry_price_val = payload.price
         entry_time_val = dt_str
         if entry_info:
             entry_price_val = entry_info["entry_price"]
-            entry_time_val = entry_info["entry_time"] or dt_str
+            entry_time_val = entry_info["entry_time"]
             p_val = entry_info["point_value"] or point
             pips_val = (payload.price - entry_price_val) / p_val if entry_info["action"] == "BUY" else (entry_price_val - payload.price) / p_val
             pips_str = f"+{pips_val:.1f} Pips" if pips_val >= 0 else f"{pips_val:.1f} Pips"
 
         reason_clean = payload.reason or "Band"
 
-        # 1. チャンネルA (決済即時通知 - 既存のまま変更なし)
+        # 1. チャンネルA (決済即時通知)
         items_a = [
             ("銘柄", f"{display_symbol} ({pos_dir})"),
             ("価格", format_price(payload.price, display_symbol)),
@@ -317,25 +309,20 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
         content_a = f"```text\n🟦【決済 検知】\n{align_lines(items_a)}\n```"
         background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_A, {"content": content_a})
 
-        # 2. チャンネルB (トレード完了成績カード - ユーザー様ご指定のレイアウト)
+        # 2. チャンネルB (トレード完了成績カード)
         trophy = "🏆" if pips_val >= 0 else "⚠️"
         header_b = f"{trophy}【トレード完了】結果: {pips_str}\n----------------------------------"
-        
-        entry_p_formatted = format_price(entry_price_val, display_symbol)
-        exit_p_formatted = format_price(payload.price, display_symbol)
-
         items_b = [
             ("銘柄", display_symbol),
-            (f"{pos_dir}価格", f"{entry_p_formatted}（{entry_time_val}）"),
-            ("決済価格", f"{exit_p_formatted}（{dt_str}）"),
+            (f"{pos_dir}価格", f"{format_price(entry_price_val, display_symbol)}（{entry_time_val}）"),
+            ("決済価格", f"{format_price(payload.price, display_symbol)}（{dt_str}）"),
             ("決済理由", reason_clean),
             ("コード", "VIDYA Signal v8"),
-            ("MT5連携", f"{mt5_str} ")
+            ("MT5連携", mt5_str)
         ]
         content_b = f"```text\n{header_b}\n{align_lines(items_b)}\n----------------------------------\n```"
         background_tasks.add_task(send_discord_webhook, DISCORD_WEBHOOK_B, {"content": content_b})
 
-        # MT5へ必ず決済指示を転送
         background_tasks.add_task(forward_to_mt5, mt5_payload_dict)
         return {"status": "success", "message": "Exit processed & notifications sent", "trade_id": trade_id, "mt5_symbol": mt5_symbol}
 
@@ -343,7 +330,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "TradingView Relay Server v2.0.1"}
+    return {"status": "ok", "service": "TradingView Relay Server v2.0.0"}
 
 if __name__ == "__main__":
     import uvicorn
